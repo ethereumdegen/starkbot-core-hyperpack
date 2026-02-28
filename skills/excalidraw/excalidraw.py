@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Excalidraw validation, export, and link utility.
+
+Usage:
+    python3 excalidraw.py validate '{"file": "path.excalidraw"}'
+    python3 excalidraw.py export  '{"file": "path.excalidraw", "format": "png", "save_public": true}'
+    python3 excalidraw.py link    '{"file": "path.excalidraw", "format": "svg"}'
+"""
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import zlib
+
+# Allowed base directories for file access (workspace and CWD)
+_ALLOWED_ROOTS = None
+
+
+def _get_allowed_roots():
+    """Return the set of allowed real directory roots for file access."""
+    global _ALLOWED_ROOTS
+    if _ALLOWED_ROOTS is None:
+        roots = [os.path.realpath(os.getcwd())]
+        workspace = os.environ.get("STARK_WORKSPACE_DIR") or os.environ.get("WORKSPACE_DIR")
+        if workspace:
+            roots.append(os.path.realpath(workspace))
+        public_dir = os.environ.get("STARK_PUBLIC_DIR")
+        if public_dir:
+            roots.append(os.path.realpath(public_dir))
+        _ALLOWED_ROOTS = roots
+    return _ALLOWED_ROOTS
+
+
+def _safe_resolve(file_path: str) -> str:
+    """Resolve a file path and verify it falls within allowed directories.
+
+    If the path doesn't exist relative to CWD, also tries WORKSPACE_DIR.
+    Returns the resolved real path or raises ValueError on traversal attempt.
+    """
+    resolved = os.path.realpath(os.path.expanduser(file_path))
+    allowed = _get_allowed_roots()
+
+    # If the file doesn't exist at resolved path and it's a relative path,
+    # try resolving relative to WORKSPACE_DIR (since CWD may be the skill dir)
+    if not os.path.exists(resolved) and not os.path.isabs(file_path):
+        workspace = os.environ.get("WORKSPACE_DIR") or os.environ.get("STARK_WORKSPACE_DIR")
+        if workspace:
+            alt = os.path.realpath(os.path.join(workspace, file_path))
+            if os.path.exists(alt):
+                resolved = alt
+
+    for root in allowed:
+        if resolved == root or resolved.startswith(root + os.sep):
+            return resolved
+    raise ValueError(
+        f"Path traversal blocked: '{file_path}' resolves outside allowed directories"
+    )
+
+
+def validate(data: dict) -> dict:
+    """Validate an excalidraw JSON file for common issues."""
+    file_path = data.get("file", "")
+    if not file_path:
+        return {"valid": False, "errors": ["file parameter is required"], "element_count": 0}
+
+    try:
+        file_path = _safe_resolve(file_path)
+    except ValueError as e:
+        return {"valid": False, "errors": [str(e)], "element_count": 0}
+
+    if not os.path.isfile(file_path):
+        return {"valid": False, "errors": ["File not found"], "element_count": 0}
+
+    try:
+        with open(file_path, "r") as f:
+            doc = json.load(f)
+    except json.JSONDecodeError as e:
+        return {"valid": False, "errors": [f"Invalid JSON: {e}"], "element_count": 0}
+
+    elements = doc.get("elements", [])
+    errors = []
+
+    # Check for duplicate IDs
+    ids = [el.get("id") for el in elements if el.get("id")]
+    seen = set()
+    for eid in ids:
+        if eid in seen:
+            errors.append(f"Duplicate ID: {eid}")
+        seen.add(eid)
+
+    # Build lookup maps
+    by_id = {el["id"]: el for el in elements if "id" in el}
+
+    for el in elements:
+        eid = el.get("id", "?")
+        el_type = el.get("type", "")
+
+        # No diamond shapes
+        if el_type == "diamond":
+            errors.append(f"Diamond shape found: {eid} — use styled rectangles instead")
+
+        # boundElements <-> containerId consistency
+        bound_elements = el.get("boundElements") or []
+        for ref in bound_elements:
+            ref_id = ref.get("id")
+            if ref_id and ref_id in by_id:
+                target = by_id[ref_id]
+                if ref.get("type") == "text" and target.get("containerId") != eid:
+                    errors.append(
+                        f"boundElements mismatch: {eid} references text {ref_id}, "
+                        f"but {ref_id}.containerId = {target.get('containerId')}"
+                    )
+
+        # containerId back-reference check
+        container_id = el.get("containerId")
+        if container_id and container_id in by_id:
+            container = by_id[container_id]
+            container_bound = container.get("boundElements") or []
+            refs = [r.get("id") for r in container_bound]
+            if eid not in refs:
+                errors.append(
+                    f"containerId mismatch: {eid}.containerId = {container_id}, "
+                    f"but {container_id}.boundElements does not reference {eid}"
+                )
+
+        # Multi-point arrows need elbowed: true, roundness: null
+        if el_type == "arrow":
+            points = el.get("points", [])
+            if len(points) > 2:
+                if not el.get("elbowed"):
+                    errors.append(f"Multi-point arrow {eid} missing elbowed: true")
+                if el.get("roundness") is not None:
+                    errors.append(f"Multi-point arrow {eid} should have roundness: null")
+
+            # Arrow bounding box vs points check
+            if points:
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                expected_w = max(xs) - min(xs)
+                expected_h = max(ys) - min(ys)
+                actual_w = el.get("width", 0)
+                actual_h = el.get("height", 0)
+                if abs(actual_w - expected_w) > 2 or abs(actual_h - expected_h) > 2:
+                    errors.append(
+                        f"Arrow {eid} bounding box mismatch: "
+                        f"expected ~{expected_w:.0f}x{expected_h:.0f}, "
+                        f"got {actual_w}x{actual_h}"
+                    )
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "element_count": len(elements),
+    }
+
+
+def export(data: dict) -> dict:
+    """Export an excalidraw file to PNG or SVG using @excalidraw/utils via Node.js."""
+    file_path = data.get("file", "")
+    fmt = data.get("format", "png").lower()
+    save_public = data.get("save_public", False)
+
+    if fmt not in ("png", "svg"):
+        return {"success": False, "error": f"Unsupported format: {fmt}"}
+
+    if not file_path:
+        return {"success": False, "error": "file parameter is required"}
+
+    try:
+        file_path = _safe_resolve(file_path)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    if not os.path.isfile(file_path):
+        return {"success": False, "error": "File not found"}
+
+    # Determine output path
+    basename = os.path.splitext(os.path.basename(file_path))[0]
+    out_name = f"{basename}.{fmt}"
+
+    if save_public:
+        # Resolve public dir — check STARK_PUBLIC_DIR env or default to stark-backend/public
+        public_dir = os.environ.get("STARK_PUBLIC_DIR", "")
+        if not public_dir:
+            # Try to find stark-backend/public relative to this script or CWD
+            candidates = [
+                os.path.join(os.getcwd(), "public"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "stark-backend", "public"),
+            ]
+            for c in candidates:
+                real = os.path.realpath(c)
+                if os.path.isdir(real):
+                    public_dir = real
+                    break
+            if not public_dir:
+                public_dir = candidates[0]
+        os.makedirs(public_dir, exist_ok=True)
+        output_path = os.path.join(public_dir, out_name)
+    else:
+        output_path = os.path.join(os.path.dirname(file_path) or ".", out_name)
+
+    # Build a Deno script to do the export
+    deno_script = f"""
+import {{ exportToSvg, exportToBlob }} from "npm:@excalidraw/utils";
+
+const data = JSON.parse(await Deno.readTextFile({json.dumps(os.path.realpath(file_path))}));
+const elements = data.elements || [];
+const appState = data.appState || {{}};
+const files = data.files || {{}};
+
+if ({json.dumps(fmt)} === 'svg') {{
+  const svg = await exportToSvg({{ elements, appState, files }});
+  await Deno.writeTextFile({json.dumps(os.path.realpath(output_path))}, svg.outerHTML || svg.toString());
+}} else {{
+  const blob = await exportToBlob({{ elements, appState, files, mimeType: 'image/png' }});
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  await Deno.writeFile({json.dumps(os.path.realpath(output_path))}, buf);
+}}
+console.log('OK');
+"""
+
+    # Write temp script and run with Deno
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as tmp:
+        tmp.write(deno_script)
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            ["deno", "run", "--allow-read", "--allow-write", "--allow-env", "--allow-net", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "Module not found" in stderr or "not found" in stderr.lower():
+                return {
+                    "success": False,
+                    "error": "Deno failed to fetch @excalidraw/utils. Check network access.",
+                    "details": stderr,
+                }
+            return {"success": False, "error": stderr or "Export failed"}
+    except FileNotFoundError:
+        return {"success": False, "error": "Deno not found in PATH"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Export timed out after 60 seconds"}
+    finally:
+        os.unlink(tmp_path)
+
+    response = {
+        "success": True,
+        "output": output_path,
+        "format": fmt,
+    }
+    if save_public:
+        response["public_url"] = f"/public/{out_name}"
+    return response
+
+
+def link(data: dict) -> dict:
+    """Generate a Kroki.io URL that renders the excalidraw drawing as SVG or PNG.
+
+    No upload needed — the entire drawing is deflate-compressed and base64-encoded in the URL.
+    """
+    file_path = data.get("file", "")
+    fmt = data.get("format", "svg").lower()
+
+    if fmt not in ("svg", "png"):
+        return {"success": False, "error": f"Unsupported format: {fmt}. Use 'svg' or 'png'."}
+
+    if not file_path:
+        return {"success": False, "error": "file parameter is required"}
+
+    try:
+        file_path = _safe_resolve(file_path)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    if not os.path.isfile(file_path):
+        return {"success": False, "error": "File not found"}
+
+    try:
+        with open(file_path, "r") as f:
+            content = f.read()
+        # Validate it's valid JSON
+        json.loads(content)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+    except OSError as e:
+        return {"success": False, "error": f"Cannot read file: {e}"}
+
+    # Encode: deflate compress → base64 URL-safe
+    compressed = zlib.compress(content.encode("utf-8"), 9)
+    encoded = base64.urlsafe_b64encode(compressed).decode("ascii")
+
+    url = f"https://kroki.io/excalidraw/{fmt}/{encoded}"
+
+    return {
+        "success": True,
+        "url": url,
+        "format": fmt,
+        "url_length": len(url),
+    }
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(json.dumps({"error": "Usage: excalidraw.py <validate|export|link> '<json_args>'"}))
+        sys.exit(1)
+
+    action = sys.argv[1]
+    try:
+        args = json.loads(sys.argv[2])
+    except json.JSONDecodeError as e:
+        print(json.dumps({"error": f"Invalid JSON arguments: {e}"}))
+        sys.exit(1)
+
+    # If args is a plain string, treat it as the file path
+    if isinstance(args, str):
+        args = {"file": args}
+
+    if action == "validate":
+        result = validate(args)
+    elif action == "export":
+        result = export(args)
+    elif action == "link":
+        result = link(args)
+    else:
+        result = {"error": f"Unknown action: {action}. Use 'validate', 'export', or 'link'."}
+
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

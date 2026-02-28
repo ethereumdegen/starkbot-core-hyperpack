@@ -1,0 +1,9 @@
+[hyperpack]
+name = "starkbot-core"
+version = "0.1.0"
+description = "Core skills, agents, and modules for StarkBot"
+
+[contents]
+skills = "skills"
+agents = "agents"
+modules = "modules"

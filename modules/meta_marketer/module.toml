@@ -1,0 +1,26 @@
+[module]
+name = "meta_marketer"
+version = "1.0.0"
+author = "starkbot"
+description = "Meta Ads manager — create campaigns, monitor performance, optimize spend, and generate creative via the Meta Marketing API"
+
+[service]
+command = "uv run service.py"
+default_port = 9110
+port_env_var = "META_MARKETER_PORT"
+has_dashboard = true
+health_endpoint = "/rpc/status"
+backup_endpoint = "/rpc/backup/export"
+restore_endpoint = "/rpc/backup/restore"
+dashboard_endpoint = "/"
+
+[service.env_vars]
+META_ACCESS_TOKEN = { required = true, description = "Meta Marketing API access token (System User token recommended for production)" }
+META_AD_ACCOUNT_ID = { required = true, description = "Meta Ad Account ID (numeric, e.g. 123456789)" }
+META_APP_SECRET = { required = false, description = "Meta App Secret for appsecret_proof (recommended for production)" }
+
+[skill]
+skill_dir = "skill"
+
+[agent]
+dir = "agent"
